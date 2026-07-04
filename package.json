@@ -1,0 +1,17 @@
+{
+  "name": "manychat-lite-cloudflare",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "tsc --noEmit && wrangler deploy --dry-run",
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "types": "wrangler types"
+  },
+  "devDependencies": {
+    "@types/node": "^26.0.1",
+    "typescript": "latest",
+    "wrangler": "latest"
+  }
+}

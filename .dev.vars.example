@@ -1,0 +1,11 @@
+WEBHOOK_VERIFY_TOKEN=choose-a-long-random-string
+INSTAGRAM_APP_SECRET=from-instagram-api-setup-page
+INSTAGRAM_ACCESS_TOKEN=from-meta-instagram-api-setup
+IG_USER_ID=your-instagram-professional-account-id
+ADMIN_TOKEN=choose-an-admin-password
+
+# Optional local override. Set to false only when you are ready to send real DMs.
+DRY_RUN=true
+
+# Optional: prevents your own comments from triggering replies.
+OWNER_IG_USERNAME=yourhandle

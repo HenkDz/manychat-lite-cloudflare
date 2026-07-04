@@ -1,0 +1,27 @@
+{
+	"$schema": "./node_modules/wrangler/config-schema.json",
+	"name": "manychat-lite-cloudflare",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-06-30",
+	"compatibility_flags": [
+		"nodejs_compat"
+	],
+	"observability": {
+		"enabled": true,
+		"head_sampling_rate": 1
+	},
+	"vars": {
+		"GRAPH_API_BASE": "https://graph.instagram.com/v25.0",
+		"KEYWORD": "guide",
+		"PRIVATE_REPLY_TEXT": "Thanks for commenting. Here is the link: https://example.com",
+		"DRY_RUN": "true"
+	},
+	"d1_databases": [
+		{
+			"binding": "DB",
+			"database_name": "manychat-lite-cloudflare",
+			"database_id": "REPLACE_WITH_D1_DATABASE_ID",
+			"migrations_dir": "./migrations"
+		}
+	]
+}
