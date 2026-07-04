@@ -119,16 +119,208 @@ https://manychat-lite-cloudflare.<your-subdomain>.workers.dev/webhook
 
 ### 5. Configure Meta
 
-In your Meta developer app:
+Meta setup is the fiddly part. The click path below is for the current Meta dashboard pattern where Instagram setup lives under **Use cases**.
 
-1. Add Instagram API access.
-2. Use an Instagram Business or Creator account.
-3. Generate an Instagram access token with the permissions needed to read/manage comments and send private replies.
-4. Add the Worker `/webhook` URL as a webhook callback.
-5. Use your `WEBHOOK_VERIFY_TOKEN` as the webhook verify token.
-6. Subscribe to Instagram comment events.
+This starter is built for **Instagram API with Instagram Login**:
+
+```text
+https://graph.instagram.com/v25.0/{IG_USER_ID}/messages
+```
+
+Do not choose the Facebook Page token / `graph.facebook.com/{PAGE_ID}/messages` path unless you plan to adapt the code.
+
+#### 5.1. Prepare the Instagram account
+
+1. Open the Instagram account you want to test with.
+2. Make sure it is a **Business** or **Creator** account.
+   - Mobile app: Profile -> menu -> Settings and privacy -> Account type and tools -> Switch to professional account.
+3. Make the account **public** while setting up the app. Meta's tester/token flow often fails silently for private accounts.
+4. Confirm you can log in to this Instagram account directly. You will need to accept a tester invitation from this account.
+
+#### 5.2. Create the Meta app with the Instagram use case
+
+1. Go to [Meta for Developers](https://developers.facebook.com/apps/).
+2. Click **Create App**.
+3. On the use case screen, choose **Manage messaging and content on Instagram**.
+   - It may appear under a **Content management** category.
+   - If Meta asks what you want the app to do, this is the option you want.
+4. Click **Next**.
+5. Enter an app name and contact email.
+6. If Meta asks for a business portfolio, choose one or skip it for local testing.
+7. Click **Create app**.
+8. Click **Go to dashboard**.
+
+If you already created a blank app, open the app dashboard and use:
+
+```text
+Use cases -> Manage messaging and content on Instagram -> Customize
+```
+
+That should add the Instagram product and the **API setup with Instagram login** screen.
+
+#### 5.3. Add the Instagram tester account
+
+In development mode, Meta only lets app roles and testers authenticate. Add your Instagram account as a tester before generating tokens.
+
+1. In the Meta app dashboard, open **App roles** or **Roles** in the left sidebar.
+2. Click **Roles** if there is a nested roles page.
+3. Click **Add people**.
+4. Choose **Instagram Tester**.
+5. Enter the Instagram username without `@`.
+6. Click **Add**.
+7. The account will usually show as **Pending**.
+
+Now accept the invite from Instagram:
+
+1. Log in to that Instagram account on web or mobile.
+2. Go to **Settings**.
+3. Open **Website permissions**.
+4. Open **Apps and websites**.
+5. Open **Tester invitations**.
+6. Find your Meta app and click **Accept**.
+7. Go back to the Meta app dashboard and refresh. The tester should now show as active.
+
+If you see `Insufficient developer role`, this invite was not accepted or you are logged into the wrong Instagram account.
+
+#### 5.4. Authenticate the Instagram account and generate a token
+
+1. In the Meta app dashboard, open:
+
+```text
+Use cases -> Manage messaging and content on Instagram -> Customize
+```
+
+2. Find **API setup with Instagram login**.
+   - In some dashboards it appears as `Instagram -> API setup with Instagram login`.
+3. Find the **Instagram accounts** or **Generate access tokens** section.
+4. Click **Add account** or **Add Instagram account**.
+5. Log in with the same Instagram Business/Creator account you added as a tester.
+6. Approve the requested permissions.
+7. Back in the dashboard, click **Generate token** for that account.
+8. Copy the token. This becomes `INSTAGRAM_ACCESS_TOKEN`.
+
+The permissions you want for this starter are:
+
+```text
+instagram_business_basic
+instagram_business_manage_comments
+instagram_business_manage_messages
+```
+
+`instagram_business_manage_comments` is needed for comment webhooks/public replies. `instagram_business_manage_messages` is needed for the private reply DM.
+
+#### 5.5. Get the Instagram user ID
+
+If Meta shows an Instagram user ID beside the connected account, copy it. That value becomes `IG_USER_ID`.
+
+If not, run:
+
+```bash
+curl -G "https://graph.instagram.com/v25.0/me" \
+  --data-urlencode "fields=id,username" \
+  --data-urlencode "access_token=PASTE_INSTAGRAM_ACCESS_TOKEN"
+```
+
+Use the returned `id` as `IG_USER_ID`.
+
+#### 5.6. Copy the app secret
+
+In the Meta app dashboard:
+
+```text
+App settings -> Basic -> App secret
+```
+
+Click **Show**, copy it, and use it as `INSTAGRAM_APP_SECRET`.
+
+The Worker uses this to verify Meta webhook signatures. If your dashboard shows an Instagram-specific app secret under the Instagram setup page, use that value.
+
+#### 5.7. Configure the webhook
+
+Deploy the Worker before this step, because Meta will immediately call your URL to verify it.
+
+1. In Meta's app dashboard, open:
+
+```text
+Use cases -> Manage messaging and content on Instagram -> Customize
+```
+
+2. Find the **Webhooks** section.
+   - In some dashboards this is under `Instagram -> Webhooks`.
+   - In older dashboards this is under `Products -> Webhooks`.
+3. Click **Configure**.
+4. Callback URL:
+
+```text
+https://manychat-lite-cloudflare.<your-subdomain>.workers.dev/webhook
+```
+
+5. Verify token: paste the same value you set as `WEBHOOK_VERIFY_TOKEN`.
+6. Click **Verify and save** or **Save**.
+7. Click **Manage** for webhook fields.
+8. Subscribe to **comments**.
+9. Optional: subscribe to **live_comments** if you want to support Instagram Live comments later.
+
+This app only needs `comments` to trigger comment auto-DMs. It does not need the `messages` webhook unless you extend the app to continue conversations after the user replies.
+
+#### 5.8. Set the matching Cloudflare secrets
+
+```bash
+npx wrangler secret put WEBHOOK_VERIFY_TOKEN
+npx wrangler secret put INSTAGRAM_APP_SECRET
+npx wrangler secret put INSTAGRAM_ACCESS_TOKEN
+npx wrangler secret put IG_USER_ID
+npx wrangler secret put ADMIN_TOKEN
+```
+
+Use this mapping:
+
+| Worker secret | Where it comes from |
+| --- | --- |
+| `WEBHOOK_VERIFY_TOKEN` | A random string you invent, also pasted into Meta's webhook setup |
+| `INSTAGRAM_APP_SECRET` | Meta app dashboard -> App settings -> Basic -> App secret |
+| `INSTAGRAM_ACCESS_TOKEN` | Instagram use case -> API setup with Instagram login -> Generate token |
+| `IG_USER_ID` | Connected Instagram account ID, or `/me?fields=id,username` response |
+| `ADMIN_TOKEN` | A password you invent for this Worker's `/admin` dashboard |
+| `OWNER_IG_USERNAME` | Optional Instagram username to ignore, without `@` |
+
+#### 5.9. Test the Meta side
+
+1. Keep `DRY_RUN` set to `"true"` in `wrangler.jsonc`.
+2. Deploy:
+
+```bash
+npm run deploy
+```
+
+3. Tail logs:
+
+```bash
+npx wrangler tail
+```
+
+4. Comment one of your rule keywords, such as `GUIDE`, on a fresh post from another Instagram account.
+5. Look for `dry_run_private_reply` in the logs.
+6. If that works, set `DRY_RUN` to `"false"`, deploy again, and test a fresh comment.
+
+#### 5.10. Common Meta setup problems
+
+- **No "Generate token" button**: confirm the app has the Instagram use case customized, the Instagram account is public, the account is Business/Creator, and the tester invitation was accepted.
+- **`Insufficient developer role`**: add the Instagram account under App roles -> Instagram Tester, then accept the invite from Instagram -> Settings -> Website permissions -> Apps and websites -> Tester invitations.
+- **Webhook verification fails**: confirm the Worker is deployed, the callback URL ends in `/webhook`, and the verify token exactly matches `WEBHOOK_VERIFY_TOKEN`.
+- **Webhook verifies but no comments arrive**: confirm you subscribed to the `comments` field and are commenting on content owned by the connected Instagram account.
+- **Dry run works but no DM sends**: confirm `DRY_RUN` is `"false"`, the token has message permissions, the comment is less than 7 days old, and you have not already sent a private reply to that comment.
+- **Works for your account but not other creators**: that is expected in development mode. For other people's accounts, you need Meta app review, Advanced Access, and a real OAuth onboarding flow.
 
 Meta setup and app review are the hardest parts of this project. The code is small; the platform permissions are the work.
+
+Useful official Meta docs to keep open:
+
+- [Create an Instagram app](https://developers.facebook.com/documentation/instagram-platform/create-an-instagram-app)
+- [Instagram webhooks](https://developers.facebook.com/documentation/instagram-platform/webhooks)
+- [Private replies](https://developers.facebook.com/documentation/instagram-platform/private-replies)
+- [App roles and testers](https://developers.facebook.com/documentation/development/build-and-test/app-roles)
+- [Rate limits](https://developers.facebook.com/docs/graph-api/overview/rate-limiting/)
 
 ### 6. Add a Rule
 
