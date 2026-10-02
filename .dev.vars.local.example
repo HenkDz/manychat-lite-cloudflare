@@ -1,0 +1,12 @@
+# Local preview ONLY: copy to .dev.vars. All values below are fake.
+# These values match scripts/demo-data.sql. Never use them on a deployed Worker.
+WEBHOOK_VERIFY_TOKEN=choose-a-long-random-string
+INSTAGRAM_APP_SECRET=from-instagram-api-setup-page
+INSTAGRAM_ACCESS_TOKEN=from-meta-instagram-api-setup
+IG_USER_ID=your-instagram-professional-account-id
+ADMIN_TOKEN=choose-an-admin-password
+
+# DRY_RUN defaults to true in wrangler.jsonc; it is not a secret.
+# Optional local overrides (uncomment in your git-ignored .dev.vars only):
+# DRY_RUN=true
+# OWNER_IG_USERNAME=yourhandle

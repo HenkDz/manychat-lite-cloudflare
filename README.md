@@ -1,5 +1,7 @@
 # ManyChat-Lite on Cloudflare
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https%3A%2F%2Fgithub.com%2FHenkDz%2Fmanychat-lite-cloudflare)
+
 A small, self-hosted starter for building a ManyChat-style Instagram auto-DM tool on Cloudflare Workers.
 
 It listens for Instagram comment and DM webhooks, matches them against keyword rules you manage in a built-in dashboard, and replies by DM: a Meta Private Reply for comments, a normal DM inside Instagram's 24-hour window for messages. It also covers the DM tools people usually want next: conversation starters, story replies, links that open a specific reply, and follower checks. It stays small: one Worker, one D1 database, no runtime dependencies.
@@ -72,12 +74,22 @@ Rules, DM tools, reply stats, activity, retries, connection
 
 For one creator, this is enough. For a real SaaS clone, keep this repo as the single-account prototype and add multi-tenant OAuth, billing, customer onboarding, and per-account token storage.
 
-## Quick Start
+## Deploy to Cloudflare
+
+Click the button above to copy this repository into your GitHub/GitLab account and deploy it to your Cloudflare account. Cloudflare creates the Worker and D1 database, collects five secrets, and runs `npm run deploy` to apply all migrations before publishing the Worker. No database IDs or Cloudflare API tokens need to be pasted into this repository.
+
+Before clicking, prepare your Meta Instagram app, professional account, app secret, Instagram Login token and account `user_id` using [Meta setup](#5-configure-meta). Choose separate strong values for `ADMIN_TOKEN` and `WEBHOOK_VERIFY_TOKEN`; fill in all five secret values in the form. Log in to Cloudflare and authorize its Git integration when asked. Keep the detected deploy command **`npm run deploy`**; there is no separate build command.
+
+After deployment, open the reported Worker URL followed by `/admin`, log in with `ADMIN_TOKEN`, and follow **Setup**. It shows the callback URL for your deployed hostname. Configure the Meta callback and account subscription, create a rule, and confirm a test match. The template stays in `DRY_RUN="true"`: no Instagram requests or messages are sent until you explicitly enable live mode in your copied repository and redeploy.
+
+Cloudflare deployment is automated; Meta app creation, credentials, webhook/account subscriptions and any required Meta review remain user setup. The button does not create a Meta app or grant Instagram permissions. See [deployment details and troubleshooting](docs/deployment.md).
+
+## Quick Start (CLI alternative)
 
 ### 1. Install
 
 ```bash
-npm install
+npm ci
 ```
 
 ### 2. Create a D1 Database
@@ -87,12 +99,12 @@ npx wrangler login
 npx wrangler d1 create manychat-lite-cloudflare
 ```
 
-Copy the returned `database_id` into `wrangler.jsonc`, replacing `REPLACE_WITH_D1_DATABASE_ID`.
+Copy the returned `database_id` into `wrangler.jsonc`, replacing the empty `database_id` string.
 
 Then apply migrations:
 
 ```bash
-npx wrangler d1 migrations apply manychat-lite-cloudflare --remote
+npm run db:migrate:remote
 ```
 
 ### 3. Set Secrets
@@ -424,12 +436,12 @@ The order for an incoming DM is: starter tap, then story rule, then DM keyword, 
 Run the Worker locally with a local D1 database:
 
 ```bash
-cp .dev.vars.example .dev.vars
-npx wrangler d1 migrations apply manychat-lite-cloudflare --local
+cp .dev.vars.local.example .dev.vars
+npm run db:migrate:local
 npm run dev
 ```
 
-Open `http://localhost:8787/admin` and log in with the `ADMIN_TOKEN` value from `.dev.vars`. `.dev.vars` is git-ignored; keep real credentials out of `.dev.vars.example`.
+Open `http://localhost:8787/admin` and log in with the `ADMIN_TOKEN` value from `.dev.vars`. `.dev.vars` is git-ignored; keep real credentials out of both tracked example files.
 
 ### Demo Data
 
@@ -439,11 +451,11 @@ To fill the dashboard with a fictional creator's rules, comments and DMs, load `
 npx wrangler d1 execute manychat-lite-cloudflare --local --file scripts/demo-data.sql
 ```
 
-Never run it with `--remote`: it replaces the DM tools settings and adds fake activity. Running it again replaces the previous demo rows. The demo includes a connection record that matches the placeholder values in `.dev.vars.example`, so copy that file unchanged to see the Connection panel filled in.
+Never run it with `--remote`: it replaces the DM tools settings and adds fake activity. Running it again replaces the previous demo rows. The demo includes a connection record that matches the fake values in `.dev.vars.local.example`, so copy that file unchanged to see the Connection panel filled in.
 
 ### Send a Signed Test Webhook
 
-With the placeholder `INSTAGRAM_APP_SECRET` and `IG_USER_ID` from `.dev.vars.example`:
+With the fake `INSTAGRAM_APP_SECRET` and `IG_USER_ID` from `.dev.vars.local.example`:
 
 ```bash
 BODY='{"object":"instagram","entry":[{"id":"your-instagram-professional-account-id","changes":[{"field":"comments","value":{"id":"local-test-1","text":"GUIDE please","from":{"id":"123","username":"local_tester"}}}]}]}'
@@ -468,13 +480,14 @@ npm run check         # TypeScript and wrangler deploy --dry-run
 
 ## Deploying Updates
 
-Apply pending migrations before deploying a new version:
+The deploy command applies pending migrations to the `DB` binding first and publishes only if they succeed. It works with renamed databases. In your copied repository, run:
 
 ```bash
-npx wrangler d1 migrations apply manychat-lite-cloudflare --remote
 npm run check
 npm run deploy
 ```
+
+For Workers Builds, keep `npm run deploy` as the deploy command. Preserve the provisioned database ID when updating; do not restore the empty template ID or re-import the template to update an existing installation.
 
 To turn on real sends, set `DRY_RUN` to `"false"` in `wrangler.jsonc` and deploy again.
 
@@ -601,4 +614,6 @@ npx wrangler d1 execute manychat-lite-cloudflare --remote --command "SELECT labe
 - `scripts/demo-data.sql` - local demo data
 - `tests/` - Node and workerd tests
 - `wrangler.jsonc` - Cloudflare Worker config and the daily cron
-- `.dev.vars.example` - local development placeholders
+- `.dev.vars.example` - required deployment secret prompts (no default values)
+- `.dev.vars.local.example` - fake credentials for local preview and demo data
+- `docs/deployment.md` - one-click deployment, required setup and validation boundaries

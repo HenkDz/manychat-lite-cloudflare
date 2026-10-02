@@ -887,6 +887,15 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
 
   return html(renderDashboardPage({
     dryRun: isDryRun(env),
+    setup: {
+      webhookUrl: new URL("/webhook", url.origin).href,
+      missingSecrets: [
+        ["WEBHOOK_VERIFY_TOKEN", env.WEBHOOK_VERIFY_TOKEN],
+        ["INSTAGRAM_APP_SECRET", env.INSTAGRAM_APP_SECRET ?? env.META_APP_SECRET],
+        ["INSTAGRAM_ACCESS_TOKEN", env.INSTAGRAM_ACCESS_TOKEN],
+        ["IG_USER_ID", env.IG_USER_ID]
+      ].filter(([, value]) => !value?.trim()).map(([name]) => name as string)
+    },
     localPreview: ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname),
     rules,
     recentEvents,

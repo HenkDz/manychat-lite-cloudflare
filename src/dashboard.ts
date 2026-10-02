@@ -18,6 +18,7 @@ import type {
 
 export type DashboardData = {
   dryRun: boolean;
+  setup: { webhookUrl: string; missingSecrets: string[] };
   localPreview: boolean;
   rules: Rule[];
   recentEvents: RecentEventRow[];
@@ -117,6 +118,7 @@ export function renderDashboardPage(data: DashboardData): string {
       <a href="#dm-tools">${icon("message")}DM tools</a>
       <a href="#performance">${icon("chart")}Reply stats</a>
       <a href="#activity">${icon("activity")}Activity</a>
+      <a href="#setup">${icon("check")}Setup</a>
       <a href="#connection">${icon("instagram")}Connection</a>
     </nav>
     <div class="sidebar-bottom">
@@ -158,8 +160,23 @@ export function renderDashboardPage(data: DashboardData): string {
     <section id="activity" class="activity panel"><div class="section-heading"><div><h2>Recent activity</h2></div><a class="text-link" href="/admin#activity">Refresh ${icon("activity")}</a></div>
     <div class="activity-tabs" role="tablist" aria-label="Activity type"><button id="comments-tab" type="button" role="tab" aria-selected="true" aria-controls="comment-activity" data-tab="comment-activity">Comments <span>${data.recentEvents.length}</span></button><button id="messages-tab" type="button" role="tab" aria-selected="false" aria-controls="message-activity" data-tab="message-activity" tabindex="-1">Direct messages <span>${data.messageEvents.length}</span></button></div>
     <div id="comment-activity" role="tabpanel" aria-labelledby="comments-tab">${filters(data.filters)}${comments(data.recentEvents, data.dryRun)}</div><div id="message-activity" role="tabpanel" aria-labelledby="messages-tab" hidden><p class="muted small activity-note">Latest 30 incoming DMs, conversation starter taps, story replies and DM link opens. Filters apply to comments only.</p>${messages(data.messageEvents)}</div></section>
+    ${setupPanel(data.setup, data.dryRun)}
     ${connectionPanel(data.connection, data.dryRun)}
   </main></div>${newRuleDialog()}<script>${clientScript}${dmFeaturesClientScript}</script></body></html>`;
+}
+
+function setupPanel(setup: DashboardData["setup"], dryRun: boolean): string {
+  return `<section id="setup" class="panel connection-panel"><div class="section-heading"><div><h2>Finish Instagram setup</h2></div>${badge(dryRun ? "Test mode" : "Live mode", dryRun ? "amber" : "green")}</div>
+    <p>${setup.missingSecrets.length ? `Missing credentials: <strong>${setup.missingSecrets.map(esc).join(", ")}</strong>. Add them as encrypted Worker secrets in Cloudflare Settings, then redeploy.` : "All required credential names are configured. Test webhook delivery to verify their values."}</p>
+    <label>Webhook callback URL<input type="url" readonly value="${esc(setup.webhookUrl)}" aria-label="Webhook callback URL"></label>
+    <ol>
+      <li>In your Meta Instagram app, configure this callback with the same verify token you entered during deployment.</li>
+      <li>Subscribe to <code>comments</code>, <code>messages</code>, <code>messaging_postbacks</code> and <code>messaging_referral</code>, then subscribe your Instagram account to the app.</li>
+      <li>Create an automation and comment its keyword from another account. Confirm a <strong>Test match</strong> in Activity before enabling live sends.</li>
+      <li>When ready, change <code>DRY_RUN</code> to <code>"false"</code> in your repository's <code>wrangler.jsonc</code> and deploy. Then use <a href="#connection">Check connection</a> to verify the account and start token renewal.</li>
+    </ol>
+    <p>Connection checks, publishing and token renewal stay off in test mode. <a href="https://github.com/HenkDz/manychat-lite-cloudflare#5-configure-meta" target="_blank" rel="noopener noreferrer">Full Meta setup instructions</a></p>
+  </section>`;
 }
 
 function connectionPanel(connection: InstagramTokenStatus, dryRun: boolean): string {

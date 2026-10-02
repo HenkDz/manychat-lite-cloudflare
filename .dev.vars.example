@@ -1,15 +1,9 @@
-# Local development only: copy to .dev.vars (git-ignored) and run `npm run dev`.
-# These are placeholders. Never put real credentials in this example file.
-# Copied unchanged, they also match the demo connection in scripts/demo-data.sql.
-WEBHOOK_VERIFY_TOKEN=choose-a-long-random-string
-INSTAGRAM_APP_SECRET=from-instagram-api-setup-page
-INSTAGRAM_ACCESS_TOKEN=from-meta-instagram-api-setup
-IG_USER_ID=your-instagram-professional-account-id
-ADMIN_TOKEN=choose-an-admin-password
-
-# Optional local override. Set to false only when you are ready to send real DMs.
-DRY_RUN=true
-
-# Optional: prevents your own comments from triggering replies, and is used for
-# DM links until the connection has been checked.
-OWNER_IG_USERNAME=yourhandle
+# Deploy to Cloudflare discovers these five required secrets.
+# No shared passwords or credentials are supplied: enter your own values.
+# Descriptions in package.json explain where each value comes from.
+# For a local demo with fake credentials, use .dev.vars.local.example instead.
+WEBHOOK_VERIFY_TOKEN=
+INSTAGRAM_APP_SECRET=
+INSTAGRAM_ACCESS_TOKEN=
+IG_USER_ID=
+ADMIN_TOKEN=
