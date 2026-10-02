@@ -8,6 +8,7 @@
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.mjs",
+    "test:runtime": "node tests/token-runtime.mjs",
     "types": "wrangler types"
   },
   "devDependencies": {

@@ -1,3 +1,4 @@
+import type { InstagramTokenStatus } from "./instagram-token";
 import type { ActivityFilters, RecentEventRow, Rule, RuleAnalyticsRow } from "./types";
 
 export function renderLoginPage(invalid: boolean): string {
@@ -49,6 +50,7 @@ export function renderDashboardPage(data: {
   rules: Rule[];
   recentEvents: RecentEventRow[];
   ruleAnalytics: RuleAnalyticsRow[];
+  connection: InstagramTokenStatus;
   filters: ActivityFilters;
   flash: string | null;
 }): string {
@@ -75,6 +77,9 @@ export function renderDashboardPage(data: {
     </header>
     <main class="dashboard">
       ${data.flash ? `<p class="flash">${escapeHtml(data.flash)}</p>` : ""}
+      ${data.connection.needsReconnect || data.connection.state === "error" ? `
+        <p class="notice" role="alert"><strong>Instagram needs attention.</strong> ${escapeHtml(data.connection.error ?? "Check the connection.")} <a href="#connection">View connection</a></p>
+      ` : ""}
       <section class="status-bar" aria-label="Overview">
         ${renderStatusItem("Mode", data.dryRun ? "Dry run" : "Live")}
         ${renderStatusItem("Active rules", String(activeRules))}
@@ -154,8 +159,57 @@ export function renderDashboardPage(data: {
         ${renderActivityFilters(data.filters)}
         ${renderRecentEvents(data.recentEvents, data.dryRun)}
       </section>
+      ${renderConnectionPanel(data.connection, data.dryRun)}
     </main>
   `);
+}
+
+function renderConnectionPanel(connection: InstagramTokenStatus, dryRun: boolean): string {
+  const label = dryRun
+    ? "Test mode"
+    : connection.state === "healthy"
+      ? "Connected"
+      : connection.needsReconnect
+        ? "Reconnect required"
+        : connection.state === "error"
+          ? "Check failed"
+          : "Not checked yet";
+  const healthy = !dryRun && connection.state === "healthy";
+  return `
+    <section class="panel connection-panel" id="connection">
+      <div class="section-head">
+        <div>
+          <h2>Instagram connection</h2>
+        </div>
+        <span class="status ${healthy ? "status-live" : "status-warn"}">${escapeHtml(label)}</span>
+      </div>
+      <p class="muted">${dryRun
+        ? "Connection checks and token renewal are off in test mode."
+        : "Checked daily. The access token renews automatically before it expires."}</p>
+      ${connection.username ? `<p><strong>@${escapeHtml(connection.username)}</strong></p>` : ""}
+      ${connection.error ? `<p class="notice" role="status">${escapeHtml(connection.error)}</p>` : ""}
+      <dl class="connection-dates">
+        <div><dt>Last checked</dt><dd>${connection.lastCheckedAt ? renderTime(connection.lastCheckedAt) : "Not yet"}</dd></div>
+        <div><dt>Last renewed</dt><dd>${connection.lastRefreshedAt ? renderTime(connection.lastRefreshedAt) : "Not yet"}</dd></div>
+        <div><dt>Next renewal</dt><dd>${connection.nextRefreshAt ? renderTime(connection.nextRefreshAt) : "After the first check"}</dd></div>
+        <div><dt>Token expires</dt><dd>${connection.expiresAt ? renderTime(connection.expiresAt) : "Known after the first renewal"}</dd></div>
+      </dl>
+      <div class="form-footer">
+        <a class="secondary-link" href="https://developers.facebook.com/apps/" target="_blank" rel="noopener noreferrer">Open Meta app settings</a>
+        <form method="post" action="/admin/connection/check">
+          <button class="secondary" type="submit" ${dryRun ? "disabled" : ""}>Check connection</button>
+        </form>
+      </div>
+    </section>
+  `;
+}
+
+function renderTime(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return escapeHtml(value);
+  }
+  return `<time datetime="${escapeAttribute(date.toISOString())}">${escapeHtml(formatTime(value))}</time>`;
 }
 
 function renderStatusItem(label: string, value: string): string {
@@ -883,6 +937,43 @@ function layout(title: string, body: string): string {
       font-weight: 680;
     }
     .retry-form { margin-top: 10px; }
+    .panel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+      padding: 18px;
+    }
+    .notice {
+      margin: 0;
+      border: 1px solid #fedf89;
+      border-radius: 10px;
+      padding: 10px 12px;
+      background: var(--warn-soft);
+      color: var(--warn);
+      font-weight: 600;
+    }
+    .notice a { color: inherit; }
+    .connection-panel > p { margin-bottom: 12px; }
+    .connection-dates {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 14px;
+      margin: 16px 0;
+    }
+    .connection-dates dt {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 680;
+    }
+    .connection-dates dd {
+      margin: 4px 0 0;
+      font-weight: 640;
+    }
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
     @keyframes enter {
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
@@ -942,10 +1033,11 @@ function formatTime(value: string): string {
   if (Number.isNaN(date.getTime())) {
     return value;
   }
-  return date.toLocaleString("en-US", {
+  return `${date.toLocaleString("en-US", {
     month: "short",
     day: "numeric",
     hour: "numeric",
-    minute: "2-digit"
-  });
+    minute: "2-digit",
+    timeZone: "UTC"
+  })} UTC`;
 }

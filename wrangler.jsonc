@@ -6,6 +6,10 @@
 	"compatibility_flags": [
 		"nodejs_compat"
 	],
+	// Daily Instagram connection check and token renewal (skipped while DRY_RUN is "true").
+	"triggers": {
+		"crons": ["0 6 * * *"]
+	},
 	"observability": {
 		"enabled": true,
 		"head_sampling_rate": 1

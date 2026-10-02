@@ -1,4 +1,10 @@
 import { renderDashboardPage, renderErrorPage, renderLoginPage, renderMissingAdminTokenPage } from "./dashboard";
+import {
+  getInstagramAccessToken,
+  getInstagramTokenStatus,
+  maintainInstagramAccessToken,
+  type InstagramTokenStatus
+} from "./instagram-token";
 import type { ActivityFilters, RecentEventRow, Rule, RuleAnalyticsRow } from "./types";
 
 type SecretEnv = {
@@ -78,6 +84,19 @@ const MAX_PUBLIC_REPLY_LENGTH = 2200;
 const MAX_PUBLIC_REPLY_TOTAL = 10000;
 
 export default {
+  // Daily cron (wrangler.jsonc): check the Instagram connection and renew the
+  // token before it expires. Skipped in test mode.
+  async scheduled(_controller: ScheduledController, env: AppEnv): Promise<void> {
+    if (isDryRun(env)) {
+      return;
+    }
+    const status = await maintainInstagramAccessToken(env);
+    console.log(JSON.stringify({ level: "info", msg: "instagram_connection_check", ...status }));
+    if (status.state === "error" || status.needsReconnect) {
+      throw new Error(status.error ?? "Instagram connection needs attention.");
+    }
+  },
+
   async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
 
@@ -95,6 +114,24 @@ export default {
 
     if (request.method === "GET" && url.pathname === "/admin") {
       return handleAdminGet(request, env, url);
+    }
+
+    if (request.method === "GET" && url.pathname === "/admin/connection") {
+      if (!(await isAdminRequest(request, env))) {
+        return json({ ok: false, error: "Login required." }, 401);
+      }
+      return json(await getConnectionStatus(env));
+    }
+
+    if (request.method === "POST" && url.pathname === "/admin/connection/check") {
+      if (!(await isAdminRequest(request, env))) {
+        return redirect("/admin");
+      }
+      // Checks call Meta, so they stay off in test mode like every other request.
+      if (!isDryRun(env) && hasInstagramCredentials(env)) {
+        await maintainInstagramAccessToken(env);
+      }
+      return redirect("/admin#connection");
     }
 
     if (request.method === "POST" && url.pathname === "/admin/login") {
@@ -211,6 +248,27 @@ async function processCommentEvent(event: CommentEvent, env: AppEnv): Promise<vo
 
 function isDryRun(env: AppEnv): boolean {
   return String(env.DRY_RUN ?? "true").toLowerCase() !== "false";
+}
+
+function hasInstagramCredentials(env: AppEnv): boolean {
+  return Boolean(env.INSTAGRAM_ACCESS_TOKEN?.trim() && env.IG_USER_ID?.trim());
+}
+
+// Safe connection details for the dashboard. Never includes token values.
+async function getConnectionStatus(env: AppEnv): Promise<InstagramTokenStatus> {
+  if (!hasInstagramCredentials(env)) {
+    return {
+      state: "reconnect",
+      username: null,
+      lastCheckedAt: null,
+      lastRefreshedAt: null,
+      nextRefreshAt: null,
+      expiresAt: null,
+      needsReconnect: true,
+      error: "Set the INSTAGRAM_ACCESS_TOKEN and IG_USER_ID secrets to connect Instagram."
+    };
+  }
+  return getInstagramTokenStatus(env);
 }
 
 async function recordCommentSendError(
@@ -452,7 +510,7 @@ async function postInstagramMessage(
   const response = await fetch(`${base}/${env.IG_USER_ID}/messages`, {
     method: "POST",
     headers: {
-      "authorization": `Bearer ${env.INSTAGRAM_ACCESS_TOKEN}`,
+      "authorization": `Bearer ${await getInstagramAccessToken(env)}`,
       "content-type": "application/json"
     },
     body: JSON.stringify({ recipient, message })
@@ -480,7 +538,7 @@ async function sendPublicCommentReply(
   const response = await fetch(endpoint.toString(), {
     method: "POST",
     headers: {
-      "authorization": `Bearer ${env.INSTAGRAM_ACCESS_TOKEN}`
+      "authorization": `Bearer ${await getInstagramAccessToken(env)}`
     }
   });
   const responseText = await response.text();
@@ -530,10 +588,11 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
   }
 
   const filters = parseActivityFilters(url);
-  const [rules, recentEvents, ruleAnalytics] = await Promise.all([
+  const [rules, recentEvents, ruleAnalytics, connection] = await Promise.all([
     getRules(env.DB, false),
     getRecentEvents(env.DB, filters),
-    getRuleAnalytics(env.DB)
+    getRuleAnalytics(env.DB),
+    getConnectionStatus(env)
   ]);
 
   return html(renderDashboardPage({
@@ -541,6 +600,7 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
     rules,
     recentEvents,
     ruleAnalytics,
+    connection,
     filters,
     flash: url.searchParams.get("saved") === "1" ? "Saved." : null
   }));
@@ -1203,7 +1263,8 @@ function json(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
     status,
     headers: {
-      "content-type": "application/json; charset=utf-8"
+      "content-type": "application/json; charset=utf-8",
+      "cache-control": "no-store"
     }
   });
 }
