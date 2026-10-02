@@ -111,8 +111,9 @@ export function renderDashboardPage(data: {
               <textarea name="reply_text" rows="5" placeholder="Thanks for commenting. Here is the link: https://..." required></textarea>
             </label>
             <label>
-              <span>Public reply</span>
-              <textarea name="public_reply_text" rows="2" placeholder="Sent it to you."></textarea>
+              <span>Public replies</span>
+              <textarea name="public_reply_text" rows="3" placeholder="Sent it to you.&#10;Check your DMs!"></textarea>
+              <span class="field-help">Optional. One reply per line; each comment gets one of them.</span>
             </label>
             <label>
               <span>Button link</span>
@@ -151,7 +152,7 @@ export function renderDashboardPage(data: {
           <span class="subtle-count">latest 50</span>
         </div>
         ${renderActivityFilters(data.filters)}
-        ${renderRecentEvents(data.recentEvents)}
+        ${renderRecentEvents(data.recentEvents, data.dryRun)}
       </section>
     </main>
   `);
@@ -210,10 +211,10 @@ function renderActivityFilters(filters: ActivityFilters): string {
           ${renderStatusOption("", "All", filters.status)}
           ${renderStatusOption("sent", "Sent", filters.status)}
           ${renderStatusOption("send_error", "Send error", filters.status)}
-          ${renderStatusOption("sent_public_reply_error", "Public reply error", filters.status)}
-          ${renderStatusOption("dry_run_matched", "Dry run", filters.status)}
+          ${renderStatusOption("sent_public_reply_error", "Public reply failed", filters.status)}
+          ${renderStatusOption("dry_run_matched", "Test match", filters.status)}
           ${renderStatusOption("ignored_no_keyword", "No keyword", filters.status)}
-          ${renderStatusOption("ignored_owner", "Owner", filters.status)}
+          ${renderStatusOption("ignored_owner", "Your comment", filters.status)}
           ${renderStatusOption("error", "Any error", filters.status)}
         </select>
       </label>
@@ -272,8 +273,9 @@ function renderRule(rule: Rule): string {
           <textarea name="reply_text" rows="3" required>${escapeHtml(rule.replyText)}</textarea>
         </label>
         <label class="span-2">
-          <span>Public reply</span>
-          <textarea name="public_reply_text" rows="2">${escapeHtml(rule.publicReplyText ?? "")}</textarea>
+          <span>Public replies</span>
+          <textarea name="public_reply_text" rows="3">${escapeHtml(rule.publicReplyText ?? "")}</textarea>
+          <span class="field-help">Optional. One reply per line; each comment gets one of them.</span>
         </label>
         <label>
           <span>Button link</span>
@@ -299,7 +301,7 @@ function renderRule(rule: Rule): string {
   `;
 }
 
-function renderRecentEvents(events: RecentEventRow[]): string {
+function renderRecentEvents(events: RecentEventRow[], dryRun: boolean): string {
   if (events.length === 0) {
     return '<p class="empty">No comments match these filters.</p>';
   }
@@ -321,9 +323,9 @@ function renderRecentEvents(events: RecentEventRow[]): string {
             ${event.matched_keyword ? `<span>Keyword: ${escapeHtml(event.matched_keyword)}</span>` : ""}
           </div>
           ${event.error ? `<small>${escapeHtml(event.error)}</small>` : ""}
-          ${isRetryableStatus(event.status) ? `
+          ${!dryRun && isRetryableStatus(event.status) ? `
             <form class="retry-form" method="post" action="/admin/events/${encodeURIComponent(event.comment_id)}/retry">
-              <button class="secondary compact" type="submit">Retry Send</button>
+              <button class="secondary compact" type="submit">${event.status === "sent_public_reply_error" ? "Retry Public Reply" : "Retry Send"}</button>
             </form>
           ` : ""}
         </article>
@@ -352,8 +354,19 @@ function statusClass(status: string): string {
   return "pill-neutral";
 }
 
+const STATUS_LABELS: Record<string, string> = {
+  received: "Received",
+  sent: "Sent",
+  sent_public_reply_error: "Public reply failed",
+  send_error: "Send failed",
+  retrying: "Retrying",
+  dry_run_matched: "Test match",
+  ignored_no_keyword: "No keyword",
+  ignored_owner: "Your comment"
+};
+
 function formatStatus(status: string): string {
-  return status.replace(/_/g, " ");
+  return STATUS_LABELS[status] ?? status.replace(/_/g, " ");
 }
 
 function layout(title: string, body: string): string {
@@ -415,6 +428,13 @@ function layout(title: string, body: string): string {
       color: #344054;
       font-size: 13px;
       font-weight: 680;
+    }
+    label .field-help, .field-help {
+      display: block;
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 500;
     }
     input, textarea, select {
       width: 100%;

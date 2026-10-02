@@ -28,6 +28,7 @@ type InstagramWebhookPayload = {
 type CommentEvent = {
   commentId: string;
   mediaId: string | null;
+  authorId: string | null;
   username: string | null;
   text: string;
 };
@@ -53,6 +54,10 @@ type RetryEventRow = {
   comment_id: string;
   matched_rule_id: number | null;
   matched_keyword: string | null;
+  rule_label: string | null;
+  status: string;
+  sent_at: string | null;
+  meta_response: string | null;
 };
 
 type SendRuleResult = {
@@ -65,10 +70,24 @@ type SendRuleResult = {
 const ADMIN_COOKIE_NAME = "ig_dm_admin";
 const ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const DEFAULT_GRAPH_API_BASE = "https://graph.instagram.com/v25.0";
+const FALLBACK_RULE_ID = 0;
+// Instagram limits: text DMs 1,000 characters, button-template text 640, comments 2,200.
+const MAX_TEXT_MESSAGE_LENGTH = 1000;
+const MAX_BUTTON_TEXT_LENGTH = 640;
+const MAX_PUBLIC_REPLY_LENGTH = 2200;
+const MAX_PUBLIC_REPLY_TOTAL = 10000;
 
 export default {
   async fetch(request: Request, env: AppEnv, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
+
+    // Dashboard forms post to their own origin. Reject cross-site form submissions.
+    if (request.method === "POST" && url.pathname.startsWith("/admin/")) {
+      const origin = request.headers.get("origin");
+      if ((origin && origin !== url.origin) || request.headers.get("sec-fetch-site") === "cross-site") {
+        return html(renderErrorPage("Admin changes must come from this dashboard."), 403);
+      }
+    }
 
     if (request.method === "GET" && url.pathname === "/") {
       return json({ ok: true, service: "manychat-lite-cloudflare", admin: "/admin" });
@@ -176,8 +195,7 @@ async function processCommentEvent(event: CommentEvent, env: AppEnv): Promise<vo
     return;
   }
 
-  const dryRun = (env.DRY_RUN ?? "true").toLowerCase() !== "false";
-  if (dryRun) {
+  if (isDryRun(env)) {
     await updateStatus(env.DB, event.commentId, "dry_run_matched", true, rule);
     console.log(JSON.stringify({ level: "info", msg: "dry_run_private_reply", event, rule: summarizeRule(rule) }));
     return;
@@ -187,21 +205,34 @@ async function processCommentEvent(event: CommentEvent, env: AppEnv): Promise<vo
     const result = await sendRuleResponses(env, event.commentId, rule);
     await updateEventAfterSend(env.DB, event.commentId, rule, result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await env.DB.prepare(
-      `UPDATE comment_events
-       SET matched = 1,
-           status = ?,
-           error = ?,
-           matched_rule_id = ?,
-           matched_keyword = ?,
-           rule_label = ?
-       WHERE comment_id = ?`
-    )
-      .bind("send_error", message, rule.id, rule.matchedKeyword, rule.label, event.commentId)
-      .run();
-    console.error(JSON.stringify({ level: "error", msg: "private_reply_failed", commentId: event.commentId, error: message }));
+    await recordCommentSendError(env.DB, event.commentId, rule, error);
   }
+}
+
+function isDryRun(env: AppEnv): boolean {
+  return String(env.DRY_RUN ?? "true").toLowerCase() !== "false";
+}
+
+async function recordCommentSendError(
+  db: D1Database,
+  commentId: string,
+  rule: MatchedRule,
+  error: unknown
+): Promise<void> {
+  const message = error instanceof Error ? error.message : String(error);
+  await db.prepare(
+    `UPDATE comment_events
+     SET matched = 1,
+         status = 'send_error',
+         error = ?,
+         matched_rule_id = ?,
+         matched_keyword = ?,
+         rule_label = ?
+     WHERE comment_id = ?`
+  )
+    .bind(message, rule.id, rule.matchedKeyword, rule.label, commentId)
+    .run();
+  console.error(JSON.stringify({ level: "error", msg: "private_reply_failed", commentId, error: message }));
 }
 
 async function sendRuleResponses(
@@ -216,12 +247,26 @@ async function sendRuleResponses(
     rule.linkUrl,
     rule.linkButtonLabel
   );
+  return completeCommentResponses(env, commentId, privateReply, rule.publicReplyText);
+}
+
+// Sends the optional public reply after a successful private reply. A retry of a
+// failed public reply calls this again with the stored private reply, so the DM
+// is never sent twice.
+async function completeCommentResponses(
+  env: AppEnv,
+  commentId: string,
+  privateReply: unknown,
+  publicReplyText: string | null,
+  sentAt = new Date().toISOString()
+): Promise<SendRuleResult> {
   let publicReply: unknown = null;
   let publicReplyError: string | null = null;
 
-  if (rule.publicReplyText) {
+  const selectedText = publicReplyText ? selectRotatingText(publicReplyText, commentId) : null;
+  if (selectedText) {
     try {
-      publicReply = await sendPublicCommentReply(env, commentId, rule.publicReplyText);
+      publicReply = await sendPublicCommentReply(env, commentId, selectedText);
     } catch (error) {
       publicReplyError = error instanceof Error ? error.message : String(error);
       console.error(JSON.stringify({
@@ -237,8 +282,31 @@ async function sendRuleResponses(
     status: publicReplyError ? "sent_public_reply_error" : "sent",
     metaResponse: { privateReply, publicReply, publicReplyError },
     error: publicReplyError,
-    sentAt: new Date().toISOString()
+    sentAt
   };
+}
+
+// Public reply text may hold several lines. One line is picked per comment, so
+// replies vary across comments, while a retry of the same comment keeps its line.
+function selectRotatingText(value: string, seed: string): string | null {
+  const options = value
+    .split(/\r?\n/)
+    .map((option) => option.trim())
+    .filter((option) => option.length > 0);
+
+  if (options.length === 0) {
+    return null;
+  }
+
+  return options[hashString(seed) % options.length];
+}
+
+function hashString(value: string): number {
+  let hash = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
+  }
+  return hash;
 }
 
 async function updateEventAfterSend(
@@ -325,13 +393,24 @@ async function findMatchingRule(db: D1Database, text: string, env: AppEnv): Prom
     }
   }
 
+  const fallback = getFallbackRule(env);
+  if (!fallback || !matchesKeyword(text, fallback.keywords[0])) {
+    return null;
+  }
+
+  return { ...fallback, matchedKeyword: fallback.keywords[0] };
+}
+
+// The KEYWORD and PRIVATE_REPLY_TEXT vars in wrangler.jsonc act as one extra rule
+// (id 0) that applies when no dashboard rule matches.
+function getFallbackRule(env: AppEnv): Rule | null {
   const fallbackKeyword = env.KEYWORD?.trim();
-  if (!fallbackKeyword || !matchesKeyword(text, fallbackKeyword)) {
+  if (!fallbackKeyword) {
     return null;
   }
 
   return {
-    id: 0,
+    id: FALLBACK_RULE_ID,
     label: "Fallback rule",
     keywords: [fallbackKeyword],
     replyText: env.PRIVATE_REPLY_TEXT ?? "Thanks for commenting.",
@@ -340,8 +419,7 @@ async function findMatchingRule(db: D1Database, text: string, env: AppEnv): Prom
     linkButtonLabel: null,
     active: true,
     createdAt: "",
-    updatedAt: "",
-    matchedKeyword: fallbackKeyword
+    updatedAt: ""
   };
 }
 
@@ -351,6 +429,20 @@ async function sendPrivateReply(
   message: string,
   linkUrl: string | null,
   linkButtonLabel: string | null
+): Promise<unknown> {
+  return postInstagramMessage(
+    env,
+    { comment_id: commentId },
+    buildPrivateReplyMessage(message, linkUrl, linkButtonLabel)
+  );
+}
+
+// Sends a private reply (recipient.comment_id) or a DM to someone who messaged
+// the account (recipient.id).
+async function postInstagramMessage(
+  env: AppEnv,
+  recipient: { comment_id: string } | { id: string },
+  message: Record<string, unknown>
 ): Promise<unknown> {
   if (!env.IG_USER_ID) {
     throw new Error("Missing IG_USER_ID");
@@ -363,10 +455,7 @@ async function sendPrivateReply(
       "authorization": `Bearer ${env.INSTAGRAM_ACCESS_TOKEN}`,
       "content-type": "application/json"
     },
-    body: JSON.stringify({
-      recipient: { comment_id: commentId },
-      message: buildPrivateReplyMessage(message, linkUrl, linkButtonLabel)
-    })
+    body: JSON.stringify({ recipient, message })
   });
 
   const responseText = await response.text();
@@ -448,7 +537,7 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
   ]);
 
   return html(renderDashboardPage({
-    dryRun: (env.DRY_RUN ?? "true").toLowerCase() !== "false",
+    dryRun: isDryRun(env),
     rules,
     recentEvents,
     ruleAnalytics,
@@ -574,14 +663,33 @@ async function handleRetryEvent(request: Request, env: AppEnv, commentId: string
     return redirect("/admin");
   }
 
+  if (isDryRun(env)) {
+    return html(renderErrorPage("Sending is off in test mode. Set DRY_RUN to \"false\" before retrying."), 400);
+  }
+
   const event = await getRetryEvent(env.DB, commentId);
-  if (!event?.matched_rule_id) {
+  if (!event || !isRetryableStatus(event.status)) {
+    return html(renderErrorPage("Only failed replies can be retried."), 400);
+  }
+
+  if (event.matched_rule_id === null) {
     return html(renderErrorPage("That comment does not have a matched rule to retry."), 400);
   }
 
-  const rule = await getRuleById(env.DB, event.matched_rule_id);
+  const rule = event.matched_rule_id === FALLBACK_RULE_ID
+    ? getFallbackRule(env)
+    : await getRuleById(env.DB, event.matched_rule_id);
   if (!rule) {
     return html(renderErrorPage("The matched rule no longer exists."), 400);
+  }
+
+  if (!rule.active) {
+    return html(renderErrorPage("This rule is turned off. Turn it on before retrying."), 400);
+  }
+
+  const originalKeyword = event.matched_keyword?.trim().toLowerCase();
+  if (originalKeyword && !rule.keywords.some((keyword) => keyword.trim().toLowerCase() === originalKeyword)) {
+    return html(renderErrorPage("The keyword this comment matched was removed from the rule, so it cannot be retried with the changed rule."), 400);
   }
 
   const matchedRule: MatchedRule = {
@@ -589,27 +697,51 @@ async function handleRetryEvent(request: Request, env: AppEnv, commentId: string
     matchedKeyword: event.matched_keyword ?? rule.keywords[0] ?? ""
   };
 
+  // Claim the event before sending so two clicks cannot deliver two DMs.
+  const claimed = await env.DB.prepare(
+    "UPDATE comment_events SET status = 'retrying' WHERE comment_id = ? AND status = ?"
+  )
+    .bind(commentId, event.status)
+    .run();
+  if (!claimed.meta.changes) {
+    return html(renderErrorPage("This reply is already being retried or has changed. Refresh the dashboard."), 409);
+  }
+
   try {
-    const result = await sendRuleResponses(env, commentId, matchedRule);
+    let result: SendRuleResult;
+    if (event.status === "sent_public_reply_error") {
+      // The DM was delivered. Only the public comment reply is sent again.
+      const stored = event.meta_response ? parseJsonText(event.meta_response) : null;
+      const privateReply = stored && typeof stored === "object"
+        ? (stored as Record<string, unknown>).privateReply
+        : null;
+      result = await completeCommentResponses(
+        env,
+        commentId,
+        privateReply,
+        matchedRule.publicReplyText,
+        event.sent_at ?? new Date().toISOString()
+      );
+    } else {
+      result = await sendRuleResponses(env, commentId, matchedRule);
+    }
     await updateEventAfterSend(env.DB, commentId, matchedRule, result);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await env.DB.prepare(
-      `UPDATE comment_events
-       SET status = ?,
-           error = ?,
-           matched = 1,
-           matched_rule_id = ?,
-           matched_keyword = ?,
-           rule_label = ?
-       WHERE comment_id = ?`
-    )
-      .bind("send_error", message, matchedRule.id, matchedRule.matchedKeyword, matchedRule.label, commentId)
-      .run();
-    console.error(JSON.stringify({ level: "error", msg: "retry_private_reply_failed", commentId, error: message }));
+    if (event.status === "sent_public_reply_error") {
+      // Keep a delivered DM marked as delivered.
+      await env.DB.prepare("UPDATE comment_events SET status = 'sent_public_reply_error', error = ? WHERE comment_id = ?")
+        .bind(error instanceof Error ? error.message : String(error), commentId)
+        .run();
+    } else {
+      await recordCommentSendError(env.DB, commentId, matchedRule, error);
+    }
   }
 
   return redirect("/admin?saved=1");
+}
+
+function isRetryableStatus(status: string): boolean {
+  return status === "send_error" || status === "sent_public_reply_error";
 }
 
 async function getRules(db: D1Database, activeOnly: boolean): Promise<Rule[]> {
@@ -636,7 +768,7 @@ async function getRuleById(db: D1Database, ruleId: number): Promise<Rule | null>
 
 async function getRetryEvent(db: D1Database, commentId: string): Promise<RetryEventRow | null> {
   return db.prepare(
-    `SELECT comment_id, matched_rule_id, matched_keyword
+    `SELECT comment_id, matched_rule_id, matched_keyword, rule_label, status, sent_at, meta_response
      FROM comment_events
      WHERE comment_id = ?`
   )
@@ -717,10 +849,13 @@ function buildActivityWhere(filters: ActivityFilters): { where: string; bindings
 
   if (filters.date && /^\d{4}-\d{2}-\d{2}$/.test(filters.date)) {
     const start = new Date(`${filters.date}T00:00:00.000Z`);
-    const end = new Date(start);
-    end.setUTCDate(end.getUTCDate() + 1);
-    clauses.push("received_at >= ? AND received_at < ?");
-    bindings.push(start.toISOString(), end.toISOString());
+    // Ignore impossible dates such as 2026-02-31 instead of throwing.
+    if (!Number.isNaN(start.getTime()) && start.toISOString().slice(0, 10) === filters.date) {
+      const end = new Date(start);
+      end.setUTCDate(end.getUTCDate() + 1);
+      clauses.push("received_at >= ? AND received_at < ?");
+      bindings.push(start.toISOString(), end.toISOString());
+    }
   }
 
   return {
@@ -777,6 +912,23 @@ function parseRuleForm(form: FormData): { ok: true; rule: Omit<Rule, "id" | "cre
     return { ok: false, error: "Button label must be 20 characters or fewer." };
   }
 
+  const maxReplyLength = linkUrl ? MAX_BUTTON_TEXT_LENGTH : MAX_TEXT_MESSAGE_LENGTH;
+  if (replyText.length > maxReplyLength) {
+    return {
+      ok: false,
+      error: linkUrl
+        ? "With a link button, the DM text must be 640 characters or fewer."
+        : "DM text must be 1,000 characters or fewer."
+    };
+  }
+
+  if (publicReplyText && (
+    publicReplyText.length > MAX_PUBLIC_REPLY_TOTAL ||
+    publicReplyText.split(/\r?\n/).some((line) => line.trim().length > MAX_PUBLIC_REPLY_LENGTH)
+  )) {
+    return { ok: false, error: "Each public reply must be 2,200 characters or fewer, with 10,000 characters in total." };
+  }
+
   return { ok: true, rule: { label, keywords, replyText, publicReplyText, linkUrl, linkButtonLabel, active } };
 }
 
@@ -828,12 +980,12 @@ function findMatchedKeyword(text: string, keywords: string[]): string | null {
 }
 
 function extractCommentEvents(payload: unknown): CommentEvent[] {
-  const data = payload as InstagramWebhookPayload;
+  const data = (payload && typeof payload === "object" ? payload : {}) as InstagramWebhookPayload;
   const events: CommentEvent[] = [];
 
-  for (const entry of data.entry ?? []) {
-    for (const change of entry.changes ?? []) {
-      if (change.field !== "comments" || !change.value) {
+  for (const entry of Array.isArray(data.entry) ? data.entry : []) {
+    for (const change of Array.isArray(entry?.changes) ? entry.changes : []) {
+      if (change?.field !== "comments" || !change.value || typeof change.value !== "object") {
         continue;
       }
 
@@ -847,6 +999,7 @@ function extractCommentEvents(payload: unknown): CommentEvent[] {
       events.push({
         commentId,
         mediaId: getMediaId(value),
+        authorId: getNestedString(value, ["from", "id"]),
         username: getNestedString(value, ["from", "username"]) ?? getString(value, "username"),
         text: getString(value, "text") ?? getString(value, "comment_text") ?? ""
       });
@@ -861,8 +1014,13 @@ function matchesKeyword(text: string, keyword: string): boolean {
   return trimmedKeyword.length > 0 && text.toLowerCase().includes(trimmedKeyword);
 }
 
+// The account's own comments (including the public replies this Worker posts)
+// must never trigger a rule.
 function isOwnerComment(event: CommentEvent, env: AppEnv): boolean {
-  const owner = env.OWNER_IG_USERNAME?.trim().toLowerCase();
+  if (event.authorId && event.authorId === env.IG_USER_ID) {
+    return true;
+  }
+  const owner = env.OWNER_IG_USERNAME?.trim().toLowerCase().replace(/^@/, "");
   return Boolean(owner && event.username?.toLowerCase() === owner);
 }
 
@@ -1054,7 +1212,8 @@ function html(markup: string, status = 200): Response {
   return new Response(markup, {
     status,
     headers: {
-      "content-type": "text/html; charset=utf-8"
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store"
     }
   });
 }
