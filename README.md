@@ -6,6 +6,8 @@ It listens for Instagram comment and DM webhooks, matches them against keyword r
 
 This project is not affiliated with ManyChat or Meta.
 
+![The dashboard, with local demo data](docs/dashboard.png)
+
 ## What It Does
 
 ```text
@@ -39,10 +41,6 @@ The starter defaults to `DRY_RUN=true` (test mode): matches are recorded as test
 - Cloudflare D1 migrations, Node and workerd test suites with mocked Meta requests
 
 ## Dashboard
-
-![Dashboard with local demo data](docs/dashboard.png)
-
-*Dashboard with local demo data*
 
 The dashboard lives at `/admin` and is protected by `ADMIN_TOKEN`. The sections:
 
