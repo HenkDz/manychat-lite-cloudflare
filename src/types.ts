@@ -32,12 +32,46 @@ export type ActivityFilters = {
   date: string;
 };
 
-export type RuleAnalyticsRow = {
-  rule_id: number;
-  rule_label: string;
-  comments_received: number;
-  matched_count: number;
-  dm_sent_count: number;
-  error_count: number;
-  last_sent_at: string | null;
+export type RecentMessageRow = {
+  message_id: string;
+  sender_id: string;
+  message_text: string;
+  source: string;
+  reply_key: string | null;
+  matched_choice: string | null;
+  status: string;
+  error: string | null;
+  received_at: string;
+  sent_at: string | null;
+  story_id: string | null;
+  story_url: string | null;
+  story_link_url: string | null;
+  referral_ref: string | null;
+  sender_username: string | null;
+  is_follower: number | null;
+  profile_error: string | null;
+  profile_checked_at: string | null;
+};
+
+// All-time totals for the overview cards. "sent" counts delivered DMs only;
+// test-mode matches are counted separately.
+export type DashboardStats = {
+  comments: number;
+  messages: number;
+  sent: number;
+  errors: number;
+  testMatches: number;
+};
+
+// One row per reply a comment or DM can trigger: keyword rules (comments and
+// DMs) and custom text replies (DMs only).
+export type ReplyStatsRow = {
+  key: string;
+  label: string;
+  kind: "rule" | "fallback" | "text";
+  commentMatches: number;
+  dmMatches: number;
+  sent: number;
+  errors: number;
+  lastSentAt: string | null;
 };

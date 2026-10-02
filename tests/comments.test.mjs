@@ -171,7 +171,7 @@ test("retrying a failed public reply resends only the public reply", async (t) =
   assert.equal(privateCalls(h).length, 1);
   assert.equal(publicCalls(h).length, 1);
   const html = await (await h.request("/admin", { headers: { cookie } })).text();
-  assert.match(html, /Retry Public Reply/);
+  assert.match(html, /Retry public reply/);
   failPublic = false;
   const retried = await h.postForm("/admin/events/public-failure/retry", {}, cookie);
   assert.equal(retried.status, 303, await retried.text());
@@ -279,6 +279,8 @@ test("admin routes require a session and reject cross-site writes", async (t) =>
     assert.equal(response.status, 403);
   }
   assert.equal(h.query("SELECT COUNT(*) AS count FROM rules").count, before);
+  const malformed = await h.request("/admin/events/%E0%A4%A/retry", { method: "POST", headers: { cookie } });
+  assert.equal(malformed.status, 400, "A malformed comment ID is rejected, not a server error");
   const dashboard = await h.request("/admin", { headers: { cookie } });
   assert.equal(dashboard.headers.get("cache-control"), "no-store");
   assert.equal(h.calls.length, 0);

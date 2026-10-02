@@ -1,11 +1,40 @@
 import { renderDashboardPage, renderErrorPage, renderLoginPage, renderMissingAdminTokenPage } from "./dashboard";
+import { extractDmEvents, matchStoryRule, matchesWholeWord, type DmEvent } from "./dm-events";
+import {
+  customReplyKey,
+  getDmFeatureSettings,
+  getIceBreakersPublicationStatus,
+  lookupInstagramProfile,
+  MAX_CUSTOM_REPLIES,
+  MAX_STORY_RULES,
+  parseCustomReplyForm,
+  parseDmFeaturesForm,
+  parseReplyKey,
+  parseReplyPayload,
+  parseReplyRef,
+  parseStoryRuleForm,
+  publishIceBreakers,
+  replyUsage,
+  ruleReplyKey,
+  saveDmFeatureSettings,
+  validateDmFeatureSettings,
+  type DmFeatureSettings,
+  type InstagramProfile
+} from "./dm-features";
 import {
   getInstagramAccessToken,
   getInstagramTokenStatus,
   maintainInstagramAccessToken,
   type InstagramTokenStatus
 } from "./instagram-token";
-import type { ActivityFilters, RecentEventRow, Rule, RuleAnalyticsRow } from "./types";
+import type {
+  ActivityFilters,
+  DashboardStats,
+  RecentEventRow,
+  RecentMessageRow,
+  ReplyStatsRow,
+  Rule
+} from "./types";
 
 type SecretEnv = {
   WEBHOOK_VERIFY_TOKEN: string;
@@ -73,6 +102,14 @@ type SendRuleResult = {
   sentAt: string;
 };
 
+// What a conversation starter, story rule, DM keyword or DM link sends.
+type ResolvedReply = {
+  key: string;
+  label: string;
+  paused: boolean;
+  message: Record<string, unknown>;
+};
+
 const ADMIN_COOKIE_NAME = "ig_dm_admin";
 const ADMIN_SESSION_TTL_SECONDS = 60 * 60 * 24 * 30;
 const DEFAULT_GRAPH_API_BASE = "https://graph.instagram.com/v25.0";
@@ -82,6 +119,15 @@ const MAX_TEXT_MESSAGE_LENGTH = 1000;
 const MAX_BUTTON_TEXT_LENGTH = 640;
 const MAX_PUBLIC_REPLY_LENGTH = 2200;
 const MAX_PUBLIC_REPLY_TOTAL = 10000;
+// Instagram allows replies to a DM for 24 hours after the person's last message.
+const MESSAGE_REPLY_WINDOW_MS = 24 * 60 * 60 * 1000;
+const MAX_CLOCK_SKEW_MS = 5 * 60 * 1000;
+const DM_FEATURE_PATHS = new Set([
+  "/admin/dm-features",
+  "/admin/dm-features/publish",
+  "/admin/story-rules",
+  "/admin/custom-replies"
+]);
 
 export default {
   // Daily cron (wrangler.jsonc): check the Instagram connection and renew the
@@ -134,6 +180,18 @@ export default {
       return redirect("/admin#connection");
     }
 
+    if (request.method === "GET" && url.pathname === "/admin/dm-features") {
+      if (!(await isAdminRequest(request, env))) {
+        return json({ ok: false, error: "Login required." }, 401);
+      }
+      const settings = await getDmFeatureSettings(env.DB);
+      return json({ settings, publication: await getIceBreakersPublicationStatus(env.DB, settings) });
+    }
+
+    if (request.method === "POST" && DM_FEATURE_PATHS.has(url.pathname)) {
+      return handleDmFeatureSettings(request, env, url.pathname);
+    }
+
     if (request.method === "POST" && url.pathname === "/admin/login") {
       return handleAdminLogin(request, env);
     }
@@ -153,7 +211,13 @@ export default {
 
     const retryMatch = url.pathname.match(/^\/admin\/events\/([^/]+)\/retry$/);
     if (request.method === "POST" && retryMatch) {
-      return handleRetryEvent(request, env, decodeURIComponent(retryMatch[1]));
+      let commentId: string;
+      try {
+        commentId = decodeURIComponent(retryMatch[1]);
+      } catch {
+        return html(renderErrorPage("That comment ID is not valid."), 400);
+      }
+      return handleRetryEvent(request, env, commentId);
     }
 
     if (request.method === "GET" && url.pathname === "/webhook") {
@@ -188,13 +252,23 @@ async function handleWebhookPost(
   }
 
   const payload = parseJsonBody(rawBody);
-  const events = extractCommentEvents(payload);
+  const commentEvents = extractCommentEvents(payload);
+  const messageEvents = await extractDmEvents(payload);
 
-  for (const event of events) {
+  for (const event of commentEvents) {
     ctx.waitUntil(processCommentEvent(event, env));
   }
 
-  return json({ ok: true, queued: events.length });
+  for (const event of messageEvents) {
+    ctx.waitUntil(processMessageEvent(event, env));
+  }
+
+  return json({
+    ok: true,
+    queued: commentEvents.length + messageEvents.length,
+    comments: commentEvents.length,
+    messages: messageEvents.length
+  });
 }
 
 function verifyWebhook(url: URL, env: AppEnv): Response {
@@ -365,6 +439,216 @@ function hashString(value: string): number {
     hash = (hash * 31 + value.charCodeAt(index)) >>> 0;
   }
   return hash;
+}
+
+// Incoming DMs, conversation starter taps, story replies and ig.me link opens.
+async function processMessageEvent(event: DmEvent, env: AppEnv): Promise<void> {
+  if (!(await insertMessageEvent(env.DB, event, new Date().toISOString()))) {
+    console.log(JSON.stringify({ level: "info", msg: "duplicate_message", messageId: event.messageId }));
+    return;
+  }
+  if (event.senderId === env.IG_USER_ID) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_self");
+    return;
+  }
+  if (event.recipientId !== env.IG_USER_ID) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_recipient");
+    return;
+  }
+  const now = Date.now();
+  if (event.timestamp === null || event.timestamp > now + MAX_CLOCK_SKEW_MS) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_invalid");
+    return;
+  }
+  if (event.timestamp <= now - MESSAGE_REPLY_WINDOW_MS) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_expired");
+    return;
+  }
+
+  const settings = await getDmFeatureSettings(env.DB);
+  const dryRun = isDryRun(env);
+  let follower: boolean | null = null;
+  // A message or starter tap allows a profile lookup. Opening a link alone does not.
+  if (!dryRun && settings.followerCheckEnabled && event.kind !== "referral") {
+    const profile = await lookupInstagramProfile(env, event.senderId).catch((): InstagramProfile => ({
+      username: null,
+      isFollower: null,
+      checkedAt: new Date().toISOString(),
+      error: "Follower status could not be checked."
+    }));
+    follower = profile.isFollower;
+    await env.DB.prepare(
+      `UPDATE message_events
+       SET sender_username = ?, is_follower = ?, profile_error = ?, profile_checked_at = ?
+       WHERE message_id = ?`
+    )
+      .bind(profile.username, follower === null ? null : Number(follower), profile.error, profile.checkedAt, event.messageId)
+      .run();
+  }
+
+  // Priority: a starter tap, then a matching story rule (a paused one blocks
+  // everything below it), then a keyword typed in the DM, then the ig.me link.
+  const starterReply = parseReplyPayload(event.quickReplyPayload);
+  const storyRule = starterReply ? null : matchStoryRule(event, settings.storyRules);
+  let replyKey: string | null;
+  let paused = false;
+  let pausedLabel: string | null = null;
+  if (starterReply) {
+    replyKey = starterReply;
+    paused = !settings.startersEnabled;
+  } else if (storyRule) {
+    replyKey = storyRule.reply;
+    paused = !storyRule.enabled;
+    pausedLabel = storyRule.label;
+  } else {
+    const keywordRule = event.kind === "message" && settings.keywordRepliesEnabled
+      ? await findDmKeywordRule(env.DB, event.text)
+      : null;
+    replyKey = keywordRule ? ruleReplyKey(keywordRule.id) : parseReplyRef(event.referralRef)?.reply ?? null;
+  }
+
+  if (!replyKey) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_no_match");
+    return;
+  }
+
+  const reply = await resolveReply(env.DB, replyKey, settings);
+  if (paused) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_paused", { replyKey, label: pausedLabel ?? reply?.label ?? replyKey });
+    return;
+  }
+  if (!reply) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_missing_reply", { replyKey, label: replyKey });
+    return;
+  }
+  if (reply.paused) {
+    await updateMessageStatus(env.DB, event.messageId, "ignored_paused", { replyKey, label: reply.label });
+    return;
+  }
+  if (dryRun) {
+    await updateMessageStatus(env.DB, event.messageId, "dry_run_matched", { replyKey, label: reply.label });
+    console.log(JSON.stringify({ level: "info", msg: "dry_run_dm_reply", messageId: event.messageId, source: event.source, reply: replyKey }));
+    return;
+  }
+
+  const greeting = follower === true ? settings.followerReply : follower === false ? settings.nonFollowerReply : "";
+  try {
+    const metaResponse = await postInstagramMessage(env, { id: event.senderId }, withFollowerGreeting(reply.message, greeting));
+    await updateMessageStatus(env.DB, event.messageId, "sent", { replyKey, label: reply.label, metaResponse });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await updateMessageStatus(env.DB, event.messageId, "send_error", { replyKey, label: reply.label, error: message });
+    console.error(JSON.stringify({ level: "error", msg: "dm_reply_failed", messageId: event.messageId, error: message }));
+  }
+}
+
+// DM keyword replies use whole words, so "guide?" matches GUIDE but "guidelines" does not.
+async function findDmKeywordRule(db: D1Database, text: string): Promise<Rule | null> {
+  if (!text.trim()) {
+    return null;
+  }
+  for (const rule of await getRules(db, true)) {
+    if (rule.keywords.some((keyword) => matchesWholeWord(text, keyword))) {
+      return rule;
+    }
+  }
+  return null;
+}
+
+async function resolveReply(db: D1Database, key: string, settings: DmFeatureSettings): Promise<ResolvedReply | null> {
+  const target = parseReplyKey(key);
+  if (!target) {
+    return null;
+  }
+  if (target.type === "rule") {
+    const rule = await getRuleById(db, target.ruleId);
+    return rule
+      ? {
+        key,
+        label: rule.label,
+        paused: !rule.active,
+        message: buildPrivateReplyMessage(rule.replyText, rule.linkUrl, rule.linkButtonLabel)
+      }
+      : null;
+  }
+  const custom = settings.customReplies.find((item) => item.id === target.textId);
+  return custom ? { key, label: custom.label, paused: false, message: { text: custom.text } } : null;
+}
+
+// Adds the follower or non-follower opening line when the combined text still
+// fits Instagram's limits. Otherwise the reply is sent unchanged.
+function withFollowerGreeting(message: Record<string, unknown>, greeting: string): Record<string, unknown> {
+  if (!greeting) {
+    return message;
+  }
+  const copy = structuredClone(message);
+  if (typeof copy.text === "string") {
+    if (greeting.length + copy.text.length + 2 <= MAX_TEXT_MESSAGE_LENGTH) {
+      copy.text = `${greeting}\n\n${copy.text}`;
+    }
+    return copy;
+  }
+  const attachment = getRecord(copy, "attachment");
+  const payload = attachment ? getRecord(attachment, "payload") : null;
+  if (payload?.template_type === "button" && typeof payload.text === "string" &&
+      greeting.length + payload.text.length + 2 <= MAX_BUTTON_TEXT_LENGTH) {
+    payload.text = `${greeting}\n\n${payload.text}`;
+  }
+  return copy;
+}
+
+async function insertMessageEvent(db: D1Database, event: DmEvent, receivedAt: string): Promise<boolean> {
+  const result = await db.prepare(
+    `INSERT OR IGNORE INTO message_events
+      (message_id, sender_id, recipient_id, message_text, quick_reply_payload, status, received_at,
+       source, story_id, story_url, story_link_url, referral_ref)
+     VALUES (?, ?, ?, ?, ?, 'received', ?, ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      event.messageId,
+      event.senderId,
+      event.recipientId,
+      event.text,
+      event.quickReplyPayload,
+      receivedAt,
+      event.source,
+      event.storyId,
+      event.storyUrl,
+      event.storyLinkUrl,
+      event.referralRef
+    )
+    .run();
+
+  return (result.meta.changes ?? 0) > 0;
+}
+
+async function updateMessageStatus(
+  db: D1Database,
+  messageId: string,
+  status: string,
+  details: { replyKey?: string; label?: string; metaResponse?: unknown; error?: string } = {}
+): Promise<void> {
+  await db.prepare(
+    `UPDATE message_events
+     SET status = ?,
+         reply_key = ?,
+         matched_choice = ?,
+         meta_response = ?,
+         error = ?,
+         sent_at = CASE WHEN ? = 'sent' THEN ? ELSE sent_at END
+     WHERE message_id = ?`
+  )
+    .bind(
+      status,
+      details.replyKey ?? null,
+      details.label ?? null,
+      details.metaResponse ? JSON.stringify(details.metaResponse) : null,
+      details.error ?? null,
+      status,
+      new Date().toISOString(),
+      messageId
+    )
+    .run();
 }
 
 async function updateEventAfterSend(
@@ -588,22 +872,151 @@ async function handleAdminGet(request: Request, env: AppEnv, url: URL): Promise<
   }
 
   const filters = parseActivityFilters(url);
-  const [rules, recentEvents, ruleAnalytics, connection] = await Promise.all([
+  const [rules, recentEvents, messageEvents, stats, connection, dmFeatures] = await Promise.all([
     getRules(env.DB, false),
     getRecentEvents(env.DB, filters),
-    getRuleAnalytics(env.DB),
-    getConnectionStatus(env)
+    getRecentMessageEvents(env.DB),
+    getDashboardStats(env.DB),
+    getConnectionStatus(env),
+    getDmFeatureSettings(env.DB)
+  ]);
+  const [replyStats, publication] = await Promise.all([
+    getReplyStats(env.DB, rules, dmFeatures),
+    getIceBreakersPublicationStatus(env.DB, dmFeatures)
   ]);
 
   return html(renderDashboardPage({
     dryRun: isDryRun(env),
+    localPreview: ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname),
     rules,
     recentEvents,
-    ruleAnalytics,
+    messageEvents,
+    replyStats,
+    stats,
     connection,
+    dmFeatures,
+    publication,
+    // Shown in the sidebar and used for DM links: the verified account name, or OWNER_IG_USERNAME.
+    accountUsername: connection.username ?? (env.OWNER_IG_USERNAME?.trim().replace(/^@/, "") || null),
     filters,
     flash: url.searchParams.get("saved") === "1" ? "Saved." : null
   }));
+}
+
+async function handleDmFeatureSettings(request: Request, env: AppEnv, path: string): Promise<Response> {
+  if (!(await isAdminRequest(request, env))) {
+    return redirect("/admin");
+  }
+
+  const settings = await getDmFeatureSettings(env.DB);
+  const ruleIds = new Set((await getRules(env.DB, false)).map((rule) => rule.id));
+
+  if (path === "/admin/dm-features/publish") {
+    if (isDryRun(env)) {
+      return html(renderErrorPage("Publishing is off in test mode. Set DRY_RUN to \"false\" before publishing conversation starters."), 409);
+    }
+    const error = validateDmFeatureSettings(settings, ruleIds);
+    if (error) {
+      return html(renderErrorPage(error), 400);
+    }
+    await publishIceBreakers(env, settings);
+    return redirect("/admin#dm-tools");
+  }
+
+  const form = await request.formData();
+  let next: DmFeatureSettings;
+  if (path === "/admin/dm-features") {
+    const parsed = parseDmFeaturesForm(form, settings, ruleIds);
+    if (!parsed.ok) {
+      return html(renderErrorPage(parsed.error), 400);
+    }
+    next = parsed.settings;
+  } else {
+    const result = path === "/admin/story-rules" ? applyStoryRuleForm(form, settings) : applyCustomReplyForm(form, settings);
+    if (!result.ok) {
+      return html(renderErrorPage(result.error), result.status);
+    }
+    next = result.settings;
+  }
+
+  const error = validateDmFeatureSettings(next, ruleIds);
+  if (error) {
+    return html(renderErrorPage(error), 400);
+  }
+  await saveDmFeatureSettings(env.DB, next);
+  return redirect("/admin?saved=1#dm-tools");
+}
+
+type SettingsChange = { ok: true; settings: DmFeatureSettings } | { ok: false; error: string; status: number };
+
+function applyStoryRuleForm(form: FormData, settings: DmFeatureSettings): SettingsChange {
+  const next = structuredClone(settings);
+  const action = getFormString(form, "action");
+  const id = getFormString(form, "id").trim();
+  const index = next.storyRules.findIndex((rule) => rule.id === id);
+  if (id && index === -1) {
+    return { ok: false, error: "Story rule was not found. Reload the dashboard.", status: 404 };
+  }
+  if (action === "delete") {
+    if (index === -1) {
+      return { ok: false, error: "Choose a story rule to delete.", status: 400 };
+    }
+    next.storyRules.splice(index, 1);
+    return { ok: true, settings: next };
+  }
+  if (action !== "save") {
+    return { ok: false, error: "Choose save or delete.", status: 400 };
+  }
+  const parsed = parseStoryRuleForm(form);
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error, status: 400 };
+  }
+  if (index === -1) {
+    if (next.storyRules.length >= MAX_STORY_RULES) {
+      return { ok: false, error: `You can save up to ${MAX_STORY_RULES} story rules.`, status: 400 };
+    }
+    next.storyRules.push(parsed.settings);
+  } else {
+    next.storyRules[index] = parsed.settings;
+  }
+  return { ok: true, settings: next };
+}
+
+function applyCustomReplyForm(form: FormData, settings: DmFeatureSettings): SettingsChange {
+  const next = structuredClone(settings);
+  const action = getFormString(form, "action");
+  const id = getFormString(form, "id").trim();
+  const index = next.customReplies.findIndex((reply) => reply.id === id);
+  if (id && index === -1) {
+    return { ok: false, error: "Custom reply was not found. Reload the dashboard.", status: 404 };
+  }
+  if (action === "delete") {
+    if (index === -1) {
+      return { ok: false, error: "Choose a custom reply to delete.", status: 400 };
+    }
+    const usage = replyUsage(next, customReplyKey(id));
+    if (usage.length > 0) {
+      return { ok: false, error: `This reply is used by the ${usage.join(" and ")}. Choose another reply there first.`, status: 400 };
+    }
+    next.customReplies.splice(index, 1);
+    return { ok: true, settings: next };
+  }
+  if (action !== "save") {
+    return { ok: false, error: "Choose save or delete.", status: 400 };
+  }
+  const parsed = parseCustomReplyForm(form);
+  if (!parsed.ok) {
+    return { ok: false, error: parsed.error, status: 400 };
+  }
+  if (index === -1) {
+    if (next.customReplies.length >= MAX_CUSTOM_REPLIES) {
+      return { ok: false, error: `You can save up to ${MAX_CUSTOM_REPLIES} custom replies.`, status: 400 };
+    }
+    next.customReplies.push(parsed.settings);
+  } else {
+    next.customReplies[index] = parsed.settings;
+  }
+  return { ok: true, settings: next };
 }
 
 async function handleAdminLogin(request: Request, env: AppEnv): Promise<Response> {
@@ -672,6 +1085,11 @@ async function handleUpdateRule(request: Request, env: AppEnv, ruleId: number): 
   const action = getFormString(form, "action");
 
   if (action === "delete") {
+    // Starters and story rules point at rules by ID; keep them working.
+    const usage = replyUsage(await getDmFeatureSettings(env.DB), ruleReplyKey(ruleId));
+    if (usage.length > 0) {
+      return html(renderErrorPage(`This rule is used by the ${usage.join(" and ")}. Choose another reply there before deleting it.`), 400);
+    }
     await env.DB.prepare("DELETE FROM rules WHERE id = ?").bind(ruleId).run();
     return redirect("/admin?saved=1");
   }
@@ -851,23 +1269,98 @@ async function getRecentEvents(db: D1Database, filters: ActivityFilters): Promis
   return result.results;
 }
 
-async function getRuleAnalytics(db: D1Database): Promise<RuleAnalyticsRow[]> {
+async function getRecentMessageEvents(db: D1Database): Promise<RecentMessageRow[]> {
   const result = await db.prepare(
-    `SELECT
-       r.id AS rule_id,
-       r.label AS rule_label,
-       COUNT(e.comment_id) AS comments_received,
-       COALESCE(SUM(CASE WHEN e.matched = 1 THEN 1 ELSE 0 END), 0) AS matched_count,
-       COALESCE(SUM(CASE WHEN e.status IN ('sent', 'sent_public_reply_error') THEN 1 ELSE 0 END), 0) AS dm_sent_count,
-       COALESCE(SUM(CASE WHEN e.status IN ('send_error', 'sent_public_reply_error') OR e.error IS NOT NULL THEN 1 ELSE 0 END), 0) AS error_count,
-       MAX(e.sent_at) AS last_sent_at
-     FROM rules r
-     LEFT JOIN comment_events e ON e.matched_rule_id = r.id
-     GROUP BY r.id, r.label
-     ORDER BY r.id ASC`
-  ).all<RuleAnalyticsRow>();
+    `SELECT message_id, sender_id, message_text, source, reply_key, matched_choice, status, error, received_at, sent_at,
+       story_id, story_url, story_link_url, referral_ref, sender_username, is_follower, profile_error, profile_checked_at
+     FROM message_events
+     ORDER BY received_at DESC
+     LIMIT 30`
+  ).all<RecentMessageRow>();
 
   return result.results;
+}
+
+// Overview totals across all comments and DMs. Test-mode matches are not deliveries.
+async function getDashboardStats(db: D1Database): Promise<DashboardStats> {
+  const result = await db.prepare(
+    `SELECT
+       (SELECT COUNT(*) FROM comment_events) AS comments,
+       (SELECT COUNT(*) FROM message_events) AS messages,
+       (SELECT COUNT(*) FROM comment_events WHERE status IN ('sent', 'sent_public_reply_error')) +
+         (SELECT COUNT(*) FROM message_events WHERE status = 'sent') AS sent,
+       (SELECT COUNT(*) FROM comment_events WHERE status IN ('send_error', 'sent_public_reply_error') OR error IS NOT NULL) +
+         (SELECT COUNT(*) FROM message_events WHERE status = 'send_error' OR error IS NOT NULL) AS errors,
+       (SELECT COUNT(*) FROM comment_events WHERE status = 'dry_run_matched') +
+         (SELECT COUNT(*) FROM message_events WHERE status = 'dry_run_matched') AS testMatches`
+  ).first<DashboardStats>();
+
+  return result ?? { comments: 0, messages: 0, sent: 0, errors: 0, testMatches: 0 };
+}
+
+type ReplyCounts = { matches: number; sent: number; errors: number; last_sent_at: string | null };
+
+// One row per keyword rule (comment matches plus DM replies that used the rule)
+// and per custom reply (DMs only).
+async function getReplyStats(db: D1Database, rules: Rule[], settings: DmFeatureSettings): Promise<ReplyStatsRow[]> {
+  const [comments, messages] = await Promise.all([
+    db.prepare(
+      `SELECT
+         matched_rule_id AS rule_id,
+         COUNT(*) AS matches,
+         SUM(CASE WHEN status IN ('sent', 'sent_public_reply_error') THEN 1 ELSE 0 END) AS sent,
+         SUM(CASE WHEN status IN ('send_error', 'sent_public_reply_error') OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors,
+         MAX(CASE WHEN status IN ('sent', 'sent_public_reply_error') THEN sent_at END) AS last_sent_at
+       FROM comment_events
+       WHERE matched_rule_id IS NOT NULL
+       GROUP BY matched_rule_id`
+    ).all<ReplyCounts & { rule_id: number }>(),
+    db.prepare(
+      `SELECT
+         reply_key,
+         COUNT(*) AS matches,
+         SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END) AS sent,
+         SUM(CASE WHEN status = 'send_error' OR error IS NOT NULL THEN 1 ELSE 0 END) AS errors,
+         MAX(CASE WHEN status = 'sent' THEN sent_at END) AS last_sent_at
+       FROM message_events
+       WHERE reply_key IS NOT NULL
+       GROUP BY reply_key`
+    ).all<ReplyCounts & { reply_key: string }>()
+  ]);
+  const commentCounts = new Map(comments.results.map((row) => [row.rule_id, row]));
+  const dmCounts = new Map(messages.results.map((row) => [row.reply_key, row]));
+  const statsRow = (
+    key: string,
+    label: string,
+    kind: ReplyStatsRow["kind"],
+    comment?: ReplyCounts,
+    dm?: ReplyCounts
+  ): ReplyStatsRow => ({
+    key,
+    label,
+    kind,
+    commentMatches: comment?.matches ?? 0,
+    dmMatches: dm?.matches ?? 0,
+    sent: (comment?.sent ?? 0) + (dm?.sent ?? 0),
+    errors: (comment?.errors ?? 0) + (dm?.errors ?? 0),
+    lastSentAt: [comment?.last_sent_at, dm?.last_sent_at].filter((value): value is string => Boolean(value)).sort().at(-1) ?? null
+  });
+
+  const rows = rules.map((rule) => statsRow(
+    ruleReplyKey(rule.id),
+    rule.label,
+    "rule",
+    commentCounts.get(rule.id),
+    dmCounts.get(ruleReplyKey(rule.id))
+  ));
+  const fallback = commentCounts.get(FALLBACK_RULE_ID);
+  if (fallback) {
+    rows.push(statsRow("fallback", "Fallback rule (KEYWORD)", "fallback", fallback));
+  }
+  for (const reply of settings.customReplies) {
+    rows.push(statsRow(customReplyKey(reply.id), reply.label, "text", undefined, dmCounts.get(customReplyKey(reply.id))));
+  }
+  return rows;
 }
 
 function parseActivityFilters(url: URL): ActivityFilters {
@@ -1210,6 +1703,13 @@ function getMediaId(value: Record<string, unknown>): string | null {
 function getString(value: Record<string, unknown>, key: string): string | null {
   const candidate = value[key];
   return typeof candidate === "string" && candidate.length > 0 ? candidate : null;
+}
+
+function getRecord(value: Record<string, unknown>, key: string): Record<string, unknown> | null {
+  const candidate = value[key];
+  return candidate && typeof candidate === "object" && !Array.isArray(candidate)
+    ? candidate as Record<string, unknown>
+    : null;
 }
 
 function getNestedString(value: Record<string, unknown>, path: string[]): string | null {
