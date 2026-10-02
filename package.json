@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "check": "tsc --noEmit && wrangler deploy --dry-run",
-    "deploy": "wrangler deploy",
+    "deploy": "npm run db:migrate:remote && wrangler deploy",
     "dev": "wrangler dev",
     "test": "node --disable-warning=ExperimentalWarning --test tests/*.test.mjs",
     "test:runtime": "node tests/token-runtime.mjs",
-    "types": "wrangler types"
+    "types": "wrangler types",
+    "db:migrate:remote": "wrangler d1 migrations apply DB --remote",
+    "db:migrate:local": "wrangler d1 migrations apply DB --local"
   },
   "devDependencies": {
     "@types/node": "^26.0.1",
@@ -17,5 +19,30 @@
     "miniflare": "^4.20260625.0",
     "typescript": "latest",
     "wrangler": "latest"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "cloudflare": {
+    "bindings": {
+      "DB": {
+        "description": "Stores your rules, activity, DM settings and encrypted renewed token. Cloudflare creates this D1 database and the deploy command applies its migrations."
+      },
+      "ADMIN_TOKEN": {
+        "description": "Choose a unique, long random password for your private `/admin` dashboard. Keep it in your password manager."
+      },
+      "WEBHOOK_VERIFY_TOKEN": {
+        "description": "Choose a separate long random value. Enter the same value when configuring the Instagram webhook callback in Meta."
+      },
+      "INSTAGRAM_APP_SECRET": {
+        "description": "Your Meta Instagram app secret, used to verify incoming webhook signatures. See [Meta setup](https://github.com/HenkDz/manychat-lite-cloudflare#5-configure-meta)."
+      },
+      "INSTAGRAM_ACCESS_TOKEN": {
+        "description": "An Instagram Login access token for your Business/Creator account with basic, comments and messaging permissions. Keep this bootstrap secret configured for encrypted token renewal."
+      },
+      "IG_USER_ID": {
+        "description": "The professional Instagram account `user_id` returned by `/me` for your token. This is not the Meta app ID or Facebook Page ID."
+      }
+    }
   }
 }

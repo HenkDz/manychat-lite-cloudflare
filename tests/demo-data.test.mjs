@@ -4,21 +4,23 @@ import { after, before, test } from "node:test";
 import { buildWorker, createHarness } from "./worker-harness.mjs";
 
 // scripts/demo-data.sql must keep working with the migrations, the dashboard
-// and the placeholder values in .dev.vars.example that the README tells people to use.
+// and the placeholder values in .dev.vars.local.example that the README tells people to use.
 let built;
 before(async () => { built = await buildWorker(); });
 after(async () => { await built?.dispose(); });
 
 async function exampleVars() {
-  const text = await readFile(".dev.vars.example", "utf8");
-  return Object.fromEntries(text.split("\n")
+  // Local Wrangler merges public configuration variables with .dev.vars secrets.
+  const config = JSON.parse((await readFile("wrangler.jsonc", "utf8")).replace(/^\s*\/\/.*$/gm, ""));
+  const text = await readFile(".dev.vars.local.example", "utf8");
+  return { ...config.vars, ...Object.fromEntries(text.split("\n")
     .filter((line) => /^[A-Z_]+=/.test(line))
-    .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1).trim()]));
+    .map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1).trim()])) };
 }
 
 test("the local demo data loads after the migrations and fills every dashboard section", async (t) => {
   const vars = await exampleVars();
-  assert.equal(vars.DRY_RUN, "true", ".dev.vars.example keeps test mode on");
+  assert.equal(vars.DRY_RUN, "true", "Wrangler configuration keeps the local demo in test mode");
   const h = await createHarness(built.worker, { ...vars, GRAPH_API_BASE: "https://graph.instagram.com/v25.0" });
   t.after(() => h.dispose());
   const sql = await readFile("scripts/demo-data.sql", "utf8");
@@ -37,7 +39,7 @@ test("the local demo data loads after the migrations and fills every dashboard s
   assert.equal(json.settings.customReplies.length, 2);
 
   const connection = await (await h.request("/admin/connection", { headers: { cookie } })).json();
-  assert.equal(connection.state, "healthy", "The demo connection record must match the .dev.vars.example placeholders");
+  assert.equal(connection.state, "healthy", "The demo connection record must match the .dev.vars.local.example placeholders");
   assert.equal(connection.username, "demo.creator");
   assert.ok(connection.nextRefreshAt && connection.expiresAt && connection.lastRefreshedAt);
 

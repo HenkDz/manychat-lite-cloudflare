@@ -2,6 +2,7 @@
 	"$schema": "./node_modules/wrangler/config-schema.json",
 	"name": "manychat-lite-cloudflare",
 	"main": "src/index.ts",
+	"workers_dev": true,
 	"compatibility_date": "2026-06-30",
 	"compatibility_flags": [
 		"nodejs_compat"
@@ -24,7 +25,8 @@
 		{
 			"binding": "DB",
 			"database_name": "manychat-lite-cloudflare",
-			"database_id": "REPLACE_WITH_D1_DATABASE_ID",
+			// Empty for templates: Deploy to Cloudflare provisions and fills in the ID.
+			"database_id": "",
 			"migrations_dir": "./migrations"
 		}
 	]
